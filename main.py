@@ -10,7 +10,9 @@ import httpx
 
 try:
     from astrbot.api.event import filter, AstrMessageEvent
-    from astrbot.api.all import Star, Context, AstrBotConfig, logger
+    from astrbot.api.all import AstrBotConfig
+    from astrbot.api.star import Context, Star, StarTools
+    from astrbot.api import logger
     import astrbot.api.message_components as Comp
 except ImportError:
     # Stubs for local testing without AstrBot installed
@@ -21,6 +23,10 @@ except ImportError:
         pass
     class AstrBotConfig(dict):
         pass
+    class StarTools:
+        @classmethod
+        def get_data_dir(cls, *args, **kwargs):
+            return Path(tempfile.gettempdir())
     class Comp:
         class Reply:
             def __init__(self, id): self.id = id
@@ -68,14 +74,17 @@ class SessionState:
     pack_slug: Optional[str] = None
     category: Optional[str] = None
     sticker_name: Optional[str] = None
+    targets: Optional[List[str]] = None
     expires_at: float = 0.0
     invalid_count: int = 0
 
 
 class MemeStickersApiPlugin(Star):
     SESSION_TIMEOUT_SECONDS = 90
+    sessions: Dict[str, SessionState] = {}
+    _terminated: bool = False
 
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: Optional[AstrBotConfig] = None, *args, **kwargs):
         super().__init__(context)
         self.config = config or {}
         raw_url = str(self.config.get("server_url") or "http://127.0.0.1:3000").strip()
@@ -84,12 +93,28 @@ class MemeStickersApiPlugin(Star):
         self.timeout = float(self.config.get("timeout", 15))
         self.default_format = str(self.config.get("default_format", "png")).lower()
         
-        self.sessions: Dict[str, SessionState] = {}
+        self.sessions = {}
+        self._terminated = False
         self._packs_cache: Optional[Dict[str, Any]] = None
         self._packs_cache_time: float = 0.0
         self._cache_ttl: float = 300.0  # 缓存 5 分钟
         # 若是本地地址，禁用系统环境变量代理以避免 127.0.0.1 请求被本地梯子拦截
         self._is_local = "127.0.0.1" in self.server_url or "localhost" in self.server_url
+
+    async def initialize(self) -> None:
+        self._terminated = False
+        if not hasattr(self, "sessions") or self.sessions is None:
+            self.sessions = {}
+
+    async def terminate(self) -> None:
+        self._terminated = True
+        if hasattr(self, "sessions") and self.sessions:
+            self.sessions.clear()
+
+    def _get_sessions(self) -> Dict[str, SessionState]:
+        if not hasattr(self, "sessions") or self.sessions is None:
+            self.sessions = {}
+        return self.sessions
 
     def _create_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(timeout=self.timeout, trust_env=not self._is_local)
@@ -391,7 +416,7 @@ class MemeStickersApiPlugin(Star):
             for cat, s_list in pack.get("categories", {}).items():
                 all_stickers.extend(s_list)
             sid = self._sid(event)
-            self.sessions[sid] = self._new_session(
+            self._get_sessions()[sid] = self._new_session(
                 mode="shortcut",
                 step="pick_sticker",
                 pack_slug=default_slug,
@@ -409,7 +434,7 @@ class MemeStickersApiPlugin(Star):
             return
 
         sid = self._sid(event)
-        self.sessions[sid] = self._new_session(
+        self._get_sessions()[sid] = self._new_session(
             mode="shortcut",
             step="pick_category",
             pack_slug=default_slug,
@@ -424,11 +449,19 @@ class MemeStickersApiPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=50)
     async def on_message(self, event: AstrMessageEvent):
-        if not self.sessions:
+        # 1. 禁用状态检查
+        if getattr(self, "_terminated", False):
+            return
+
+        # 2. 快速短路：防守性获取会话字典，绝不抛出 AttributeError 影响正常消息流水线
+        sessions = getattr(self, "sessions", None)
+        if not sessions:
+            if not hasattr(self, "sessions") or self.sessions is None:
+                self.sessions = {}
             return
 
         sid = self._sid(event)
-        st = self.sessions.get(sid)
+        st = sessions.get(sid)
         if not st:
             return
 
@@ -436,32 +469,36 @@ class MemeStickersApiPlugin(Star):
         if not txt:
             return
 
+        # 3. 会话过期检查
         if st.expires_at and self._now() > st.expires_at:
-            self.sessions.pop(sid, None)
+            sessions.pop(sid, None)
             return
 
+        # 4. 指令前缀检查（用户在制作过程中输入了其他指令，立即放行并退出会话）
         COMMAND_PREFIXES = ("/", "!", "！", "#", ".", "。", "、", "~", "$")
         txt_lower = txt.lower()
         if txt.startswith(COMMAND_PREFIXES) or txt_lower in {
             "pjsk", "arc", "arcaea", "meme-stickers", "stickers", "help", "菜单", "帮助"
         }:
-            self.sessions.pop(sid, None)
+            sessions.pop(sid, None)
             return
 
+        # 5. 退出指令检查
         if self._is_exit(txt):
-            self.sessions.pop(sid, None)
+            sessions.pop(sid, None)
             if hasattr(event, "stop_event"):
                 event.stop_event()
             yield self._plain(event, "已退出表情包制作")
             return
 
+        # 6. 命中当前会话交互，阻止事件向后传播至 LLM 或其他插件
         if hasattr(event, "stop_event"):
             event.stop_event()
 
         packs = await self._fetch_packs()
         pack = packs.get(st.pack_slug or "pjsk")
         if not pack:
-            self.sessions.pop(sid, None)
+            sessions.pop(sid, None)
             yield self._plain(event, "贴纸包不可用，制作已结束。")
             return
 
@@ -477,7 +514,7 @@ class MemeStickersApiPlugin(Star):
             if not chosen_cat:
                 st.invalid_count += 1
                 if st.invalid_count >= 2:
-                    self.sessions.pop(sid, None)
+                    sessions.pop(sid, None)
                     yield self._plain(event, "未匹配到分类，已自动退出表情包制作。")
                     return
                 yield self._plain(event, "未找到该分类，请重新输入序号或分类名称（输入 0 退出）")
@@ -507,7 +544,7 @@ class MemeStickersApiPlugin(Star):
         if st.step == "pick_sticker":
             if self._is_back(txt):
                 if pack.get("disable_category_select"):
-                    self.sessions.pop(sid, None)
+                    sessions.pop(sid, None)
                     yield self._plain(event, "已退出表情包制作")
                     return
                 st.step = "pick_category"
@@ -535,7 +572,7 @@ class MemeStickersApiPlugin(Star):
             if not chosen_sticker:
                 st.invalid_count += 1
                 if st.invalid_count >= 2:
-                    self.sessions.pop(sid, None)
+                    sessions.pop(sid, None)
                     yield self._plain(event, "未匹配到表情，已自动退出表情包制作。")
                     return
                 yield self._plain(event, "未找到该表情，请重新输入序号或表情名称（输入 0 退出）")
@@ -567,4 +604,4 @@ class MemeStickersApiPlugin(Star):
             except Exception as e:
                 yield self._plain(event, f"生成表情包失败: {e}")
             finally:
-                self.sessions.pop(sid, None)
+                sessions.pop(sid, None)
