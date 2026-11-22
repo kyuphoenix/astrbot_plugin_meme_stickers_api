@@ -148,11 +148,34 @@ class MemeStickersApiPlugin(Star):
     def _now() -> float:
         return time.time()
 
-    def _new_session(self, **kwargs) -> SessionState:
-        return SessionState(expires_at=self._now() + self.SESSION_TIMEOUT_SECONDS, **kwargs)
+    def _arm_session_timer(self, sid: str, expire_time: float, event: AstrMessageEvent):
+        """主动超时后台定时器：到期后自动向用户发送超时提示并清理会话"""
+        async def _timer_worker():
+            await asyncio.sleep(self.SESSION_TIMEOUT_SECONDS)
+            sessions = getattr(self, "sessions", {})
+            st = sessions.get(sid)
+            if st and abs(st.expires_at - expire_time) < 0.1:
+                sessions.pop(sid, None)
+                try:
+                    if hasattr(self.context, "send_message") and hasattr(event, "unified_msg_origin"):
+                        from astrbot.api.event import MessageChain
+                        chain = MessageChain([Comp.Plain("⏳ 表情包制作已超时（超过90秒无操作），已自动退出。如需制作请重新发送指令。")])
+                        await self.context.send_message(event.unified_msg_origin, chain)
+                except Exception as e:
+                    logger.debug(f"会话超时自动提醒异常: {e}")
 
-    def _touch_session(self, st: SessionState):
-        st.expires_at = self._now() + self.SESSION_TIMEOUT_SECONDS
+        asyncio.create_task(_timer_worker())
+
+    def _new_session(self, sid: str, event: AstrMessageEvent, **kwargs) -> SessionState:
+        expire_time = self._now() + self.SESSION_TIMEOUT_SECONDS
+        st = SessionState(expires_at=expire_time, **kwargs)
+        self._arm_session_timer(sid, expire_time, event)
+        return st
+
+    def _touch_session(self, sid: str, st: SessionState, event: AstrMessageEvent):
+        expire_time = self._now() + self.SESSION_TIMEOUT_SECONDS
+        st.expires_at = expire_time
+        self._arm_session_timer(sid, expire_time, event)
 
     @staticmethod
     def _is_exit(txt: str) -> bool:
@@ -181,6 +204,21 @@ class MemeStickersApiPlugin(Star):
                 yield event.chain_result([reply, img])
                 return
             yield event.image_result(str(p))
+        finally:
+            p.unlink(missing_ok=True)
+
+    async def _send_image_with_caption(self, event: AstrMessageEvent, data: bytes, caption: str, suffix: str = "api", ext: str = "jpeg"):
+        """图文合并发送：将预览图与交互说明合并在同一条消息中发送"""
+        p = Path(tempfile.gettempdir()) / f"meme_{suffix}_{id(event)}_{time.time_ns()}.{ext}"
+        p.write_bytes(data)
+        try:
+            comps = []
+            if self.quote_reply and hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
+                comps.append(Comp.Reply(id=event.message_obj.message_id))
+            comps.append(Comp.Image.fromFileSystem(str(p)))
+            if caption:
+                comps.append(Comp.Plain(f"\n{caption}"))
+            yield event.chain_result(comps)
         finally:
             p.unlink(missing_ok=True)
 
@@ -462,24 +500,23 @@ class MemeStickersApiPlugin(Star):
         if pack.get("disable_category_select"):
             sid = self._sid(event)
             self._get_sessions()[sid] = self._new_session(
+                sid=sid,
+                event=event,
                 mode="shortcut",
                 step="pick_sticker",
                 pack_slug=default_slug,
             )
+            caption = f"已进入 {pack.get('name', default_slug)} 贴纸选择，请发送名称或序号（输入 0 退出）"
             try:
                 grid_bytes = await self._call_grid_api(default_slug)
-                async for r in self._send_image(event, grid_bytes, f"pick_sticker_{default_slug}", ext="jpeg"):
+                async for r in self._send_image_with_caption(event, grid_bytes, caption, f"pick_sticker_{default_slug}", ext="jpeg"):
                     yield r
             except Exception as e:
                 logger.error(f"获取全量贴纸预览网格失败: {e}", exc_info=True)
                 yield self._plain(
                     event,
-                    f"⚠️ 贴纸预览图生成失败（{e}）。\n提示：你仍可直接发送贴纸名称或序号进行制作：",
+                    f"⚠️ 贴纸预览图生成失败（{e}）。\n提示：你仍可直接发送贴纸名称或序号进行制作：\n{caption}",
                 )
-            yield self._plain(
-                event,
-                f"已进入 {pack.get('name', default_slug)} 贴纸选择，请发送名称或序号（输入 0 退出）",
-            )
             return
 
         categories = sorted(pack.get("categories", {}).keys())
@@ -489,26 +526,25 @@ class MemeStickersApiPlugin(Star):
 
         sid = self._sid(event)
         self._get_sessions()[sid] = self._new_session(
+            sid=sid,
+            event=event,
             mode="shortcut",
             step="pick_category",
             pack_slug=default_slug,
         )
 
+        caption = f"已进入 {pack.get('name', default_slug)} 角色选择，请发送名称或序号（输入 0 退出）"
         try:
             grid_bytes = await self._call_grid_api(default_slug)
-            async for r in self._send_image(event, grid_bytes, f"pick_category_{default_slug}", ext="jpeg"):
+            async for r in self._send_image_with_caption(event, grid_bytes, caption, f"pick_category_{default_slug}", ext="jpeg"):
                 yield r
         except Exception as e:
             logger.error(f"获取分类预览网格失败: {e}", exc_info=True)
             yield self._plain(
                 event,
-                f"⚠️ 分类预览图生成失败（{e}）。\n提示：你仍可直接发送角色名称或序号进行选择：",
+                f"⚠️ 分类预览图生成失败（{e}）。\n提示：你仍可直接发送角色名称或序号进行选择：\n{caption}",
             )
-
-        yield self._plain(
-            event,
-            f"已进入 {pack.get('name', default_slug)} 角色选择，请发送名称或序号（输入 0 退出）",
-        )
+        return
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=50)
     async def on_message(self, event: AstrMessageEvent):
@@ -535,6 +571,9 @@ class MemeStickersApiPlugin(Star):
         # 3. 会话过期检查
         if st.expires_at and self._now() > st.expires_at:
             sessions.pop(sid, None)
+            if hasattr(event, "stop_event"):
+                event.stop_event()
+            yield self._plain(event, "⏳ 表情包制作已超时（超过90秒无操作），已自动退出。如需制作请重新发送指令。")
             return
 
         # 4. 指令前缀检查（用户在制作过程中输入了其他指令，立即放行并退出会话）
@@ -584,7 +623,7 @@ class MemeStickersApiPlugin(Star):
                 return
 
             st.invalid_count = 0
-            self._touch_session(st)
+            self._touch_session(sid, st, event)
             st.category = chosen_cat
             stickers = pack["categories"][chosen_cat]
 
@@ -595,17 +634,17 @@ class MemeStickersApiPlugin(Star):
                 return
 
             st.step = "pick_sticker"
+            caption = f"已进入【{chosen_cat}】角色，请发送贴纸名称或序号（输入 r 返回分类，0 退出）"
             try:
                 grid_bytes = await self._call_grid_api(st.pack_slug or "pjsk", category=chosen_cat)
-                async for r in self._send_image(event, grid_bytes, "pick_sticker", ext="jpeg"):
+                async for r in self._send_image_with_caption(event, grid_bytes, caption, "pick_sticker", ext="jpeg"):
                     yield r
             except Exception as e:
                 logger.error(f"获取贴纸预览网格失败: {e}", exc_info=True)
                 yield self._plain(
                     event,
-                    f"⚠️ 贴纸预览图生成失败（{e}）。\n提示：你仍可直接发送贴纸名称或序号：",
+                    f"⚠️ 贴纸预览图生成失败（{e}）。\n提示：你仍可直接发送贴纸名称或序号：\n{caption}",
                 )
-            yield self._plain(event, "请输入贴纸名称或序号（输入 r 返回分类，0 退出）")
             return
 
         # 步骤 2：选择表情
@@ -617,14 +656,18 @@ class MemeStickersApiPlugin(Star):
                     return
                 st.step = "pick_category"
                 st.invalid_count = 0
-                self._touch_session(st)
+                self._touch_session(sid, st, event)
+                caption = "已返回角色分类选择，请发送名称或序号（输入 0 退出）"
                 try:
                     grid_bytes = await self._call_grid_api(st.pack_slug or "pjsk")
-                    async for r in self._send_image(event, grid_bytes, "pick_category", ext="jpeg"):
+                    async for r in self._send_image_with_caption(event, grid_bytes, caption, "pick_category", ext="jpeg"):
                         yield r
                 except Exception as e:
-                    logger.warning(f"获取分类预览网格失败: {e}")
-                yield self._plain(event, "已返回角色分类选择，请发送名称或序号（输入 0 退出）")
+                    logger.error(f"获取分类预览网格失败: {e}", exc_info=True)
+                    yield self._plain(
+                        event,
+                        f"⚠️ 获取分类预览网格失败（{e}）。\n提示：你仍可直接发送角色名称或序号进行选择：\n{caption}",
+                    )
                 return
 
             if pack.get("disable_category_select"):
@@ -649,7 +692,7 @@ class MemeStickersApiPlugin(Star):
                 return
 
             st.invalid_count = 0
-            self._touch_session(st)
+            self._touch_session(sid, st, event)
             st.sticker_name = chosen_sticker.get("name")
             st.step = "input_text"
             yield self._plain(event, f"已选择表情【{st.sticker_name}】，请输入要添加的表情包文字（输入 0 退出）:")
@@ -684,6 +727,7 @@ class MemeStickersApiPlugin(Star):
             (f"/{self.PLUGIN_NAME}/packs", self.web_get_packs_detail, ["GET"], "获取贴纸包详情树"),
             (f"/{self.PLUGIN_NAME}/generate", self.web_generate, ["POST"], "Playground生成贴纸图片"),
             (f"/{self.PLUGIN_NAME}/sticker_image", self.web_get_sticker_image, ["GET"], "获取贴纸底图"),
+            (f"/{self.PLUGIN_NAME}/font/file", self.web_get_font_file, ["GET"], "获取主字体文件"),
             (f"/{self.PLUGIN_NAME}/font/primary", self.web_get_primary_font, ["GET"], "获取主字体"),
             (f"/{self.PLUGIN_NAME}/reload", self.web_reload_packs, ["POST"], "重载贴纸包"),
             (f"/{self.PLUGIN_NAME}/switch_mirror", self.web_switch_mirror, ["POST"], "切换镜像源预设"),
@@ -894,26 +938,62 @@ class MemeStickersApiPlugin(Star):
             logger.error(f"web_get_sticker_image 出错: {e}", exc_info=True)
             return error_response(f"获取底图失败: {e}", status_code=500)
 
+    async def _fetch_font_bytes(self) -> Optional[bytes]:
+        """优先从本地插件目录读取字体，若缺失则从服务端或 CDN 兜底"""
+        local_font = Path(__file__).resolve().parent / "fonts" / "YurukaFangTang.ttf"
+        if local_font.exists() and local_font.stat().st_size > 100000:
+            return local_font.read_bytes()
+
+        urls = [
+            f"{self.server_url}/fonts/YurukaFangTang.ttf",
+            "https://cdn.jsdelivr.net/gh/kyuphoenix/pjsk-stickers-server@main/fonts/YurukaFangTang.ttf",
+            "https://ghfast.top/https://raw.githubusercontent.com/kyuphoenix/pjsk-stickers-server/main/fonts/YurukaFangTang.ttf",
+            "https://raw.githubusercontent.com/kyuphoenix/pjsk-stickers-server/main/fonts/YurukaFangTang.ttf",
+        ]
+        async with self._create_client() as client:
+            for u in urls:
+                try:
+                    resp = await client.get(u)
+                    if resp.status_code == 200 and len(resp.content) > 100000:
+                        try:
+                            local_font.parent.mkdir(parents=True, exist_ok=True)
+                            local_font.write_bytes(resp.content)
+                        except Exception:
+                            pass
+                        return resp.content
+                except Exception:
+                    pass
+        return None
+
+    async def web_get_font_file(self, *args, **kwargs):
+        try:
+            font_data = await self._fetch_font_bytes()
+            if font_data:
+                from aiohttp import web
+                return web.Response(
+                    body=font_data,
+                    content_type="font/ttf",
+                    headers={
+                        "Access-Control-Allow-Origin": "*",
+                        "Cache-Control": "public, max-age=31536000",
+                    }
+                )
+            return error_response("未获取到主字体文件", status_code=404)
+        except Exception as e:
+            logger.error(f"web_get_font_file 出错: {e}", exc_info=True)
+            return error_response(f"获取字体文件失败: {e}", status_code=500)
+
     async def web_get_primary_font(self, *args, **kwargs):
         try:
-            urls = [
-                f"{self.server_url}/fonts/YurukaFangTang.ttf",
-                "https://cdn.jsdelivr.net/gh/kyuphoenix/astrbot_plugin_meme_stickers@main/astrbot_plugin_meme_stickers/meme_stickers_core/fonts/YurukaFangTang.ttf",
-            ]
-            async with self._create_client() as client:
-                for u in urls:
-                    try:
-                        resp = await client.get(u)
-                        if resp.status_code == 200 and len(resp.content) > 1000:
-                            b64 = base64.b64encode(resp.content).decode("ascii")
-                            return json_response({
-                                "status": "ok",
-                                "data": {
-                                    "data_uri": f"data:font/ttf;base64,{b64}"
-                                }
-                            })
-                    except Exception:
-                        pass
+            font_data = await self._fetch_font_bytes()
+            if font_data:
+                b64 = base64.b64encode(font_data).decode("ascii")
+                return json_response({
+                    "status": "ok",
+                    "data": {
+                        "data_uri": f"data:font/ttf;base64,{b64}"
+                    }
+                })
             return error_response("未获取到主字体", status_code=404)
         except Exception as e:
             logger.error(f"web_get_primary_font 出错: {e}", exc_info=True)
