@@ -84,6 +84,7 @@ class MemeStickersApiPlugin(Star):
         self.timeout = float(self.config.get("timeout", 15))
         self.default_format = str(self.config.get("default_format", "png")).lower()
         
+        self.sessions: Dict[str, SessionState] = {}
         self._packs_cache: Optional[Dict[str, Any]] = None
         self._packs_cache_time: float = 0.0
         self._cache_ttl: float = 300.0  # 缓存 5 分钟
