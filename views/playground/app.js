@@ -5,12 +5,24 @@ const PLUGIN_NAME = "astrbot_plugin_meme_stickers_api";
 
 class BridgeClient {
   constructor() {
-    this.bridge = window.$astrbot || window.parent?.$astrbot || null;
+    this.bridge = window.AstrBotPluginView || window.AstrBotPluginPage || window.parent?.AstrBotPluginView || window.parent?.AstrBotPluginPage || null;
+  }
+
+  async init() {
+    if (this.bridge && typeof this.bridge.ready === "function") {
+      try {
+        await this.bridge.ready();
+        console.log("[Bridge] AstrBot Bridge initialized successfully.");
+      } catch (err) {
+        console.warn("[Bridge] Bridge ready warning:", err);
+      }
+    }
   }
 
   async apiGet(endpoint, params = {}) {
     if (this.bridge && typeof this.bridge.apiGet === "function") {
-      return await this.bridge.apiGet(endpoint, params);
+      const res = await this.bridge.apiGet(endpoint, params);
+      return (res && res.data !== undefined) ? res.data : res;
     }
     const cleanEp = endpoint.replace(/^\/+/, "");
     const q = new URLSearchParams(params).toString();
@@ -25,12 +37,13 @@ class BridgeClient {
       throw new Error(`HTTP ${res.status}: ${errDetail}`);
     }
     const json = await res.json();
-    return json.data !== undefined ? json.data : json;
+    return (json && json.data !== undefined) ? json.data : json;
   }
 
   async apiPost(endpoint, body = {}) {
     if (this.bridge && typeof this.bridge.apiPost === "function") {
-      return await this.bridge.apiPost(endpoint, body);
+      const res = await this.bridge.apiPost(endpoint, body);
+      return (res && res.data !== undefined) ? res.data : res;
     }
     const cleanEp = endpoint.replace(/^\/+/, "");
     const url = `/api/plug/${PLUGIN_NAME}/${cleanEp}`;
@@ -52,13 +65,14 @@ class BridgeClient {
       throw new Error(`HTTP ${res.status}: ${errDetail}`);
     }
     const json = await res.json();
-    return json.data !== undefined ? json.data : json;
+    return (json && json.data !== undefined) ? json.data : json;
   }
 }
 
 const client = new BridgeClient();
 
 // State
+let serverUrl = "";
 let globalPacksTree = {};
 let currentSelectedSticker = null;
 let currentBaseImage = null;
@@ -839,9 +853,9 @@ elements.btnCopy.addEventListener("click", async () => {
 async function loadPacksDetail() {
   try {
     const data = await client.apiGet("packs");
-    globalPacksTree = data || {};
+    globalPacksTree = (data && typeof data === "object") ? (data.data || data) : {};
 
-    const slugs = Object.keys(globalPacksTree);
+    const slugs = Object.keys(globalPacksTree).filter(k => k !== "status" && k !== "data");
     elements.packSelect.innerHTML = "";
 
     if (slugs.length === 0) {
@@ -849,17 +863,22 @@ async function loadPacksDetail() {
       return;
     }
 
+    elements.packSelect.innerHTML = '<option value="">-- 请选择贴纸包 --</option>';
     slugs.forEach((slug) => {
       const p = globalPacksTree[slug];
       const opt = document.createElement("option");
       opt.value = slug;
-      opt.textContent = `${p.name || slug} (${slug})`;
+      opt.textContent = `${p?.name || slug} (${slug})`;
       elements.packSelect.appendChild(opt);
     });
 
-    elements.packSelect.dispatchEvent(new Event("change"));
+    if (slugs.length > 0) {
+      elements.packSelect.selectedIndex = 1;
+      elements.packSelect.dispatchEvent(new Event("change"));
+    }
   } catch (err) {
     console.error("加载贴纸包失败:", err);
+    elements.packSelect.innerHTML = `<option value="">加载贴纸包失败: ${err.message || err}</option>`;
   }
 }
 
@@ -867,24 +886,34 @@ async function loadPacksDetail() {
 async function loadStatus() {
   try {
     const res = await client.apiGet("status");
-    if (res.backend_online) {
+    if (res && res.server_url) {
+      serverUrl = res.server_url;
+    }
+    if (res && res.backend_online) {
       elements.backendStatusBadge.className = "badge badge-success";
       elements.backendStatusBadge.textContent = `🟢 渲染服务在线 (${res.backend_latency_ms || 0}ms)`;
     } else {
       elements.backendStatusBadge.className = "badge badge-warning";
-      elements.backendStatusBadge.textContent = `🔴 渲染服务未连接 (${res.server_url || ""})`;
+      elements.backendStatusBadge.textContent = `🔴 渲染服务未连接 (${res?.server_url || "离线"})`;
     }
   } catch (err) {
+    console.error("检测服务状态失败:", err);
     elements.backendStatusBadge.className = "badge badge-warning";
-    elements.backendStatusBadge.textContent = "🔴 渲染服务异常";
+    elements.backendStatusBadge.textContent = `🔴 服务状态异常 (${err.message || "请求失败"})`;
   }
 }
 
-// Init
-async function init() {
-  await loadStatus();
-  await loadPacksDetail();
-  initWebFont();
+// Bootstrap
+async function bootstrap() {
+  console.log("[Playground] Bootstrapping...");
+  await client.init();
+  initWebFont(); // Load font from CDN / CacheStorage asynchronously
+  await Promise.allSettled([loadStatus(), loadPacksDetail()]);
+  console.log("[Playground] Ready!");
 }
 
-window.addEventListener("DOMContentLoaded", init);
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", bootstrap);
+} else {
+  bootstrap();
+}

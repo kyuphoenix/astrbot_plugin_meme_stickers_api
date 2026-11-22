@@ -125,6 +125,7 @@ class MemeStickersApiPlugin(Star):
         self._terminated = False
         if not hasattr(self, "sessions") or self.sessions is None:
             self.sessions = {}
+        self._register_web_apis()
 
     async def terminate(self) -> None:
         self._terminated = True
@@ -222,13 +223,14 @@ class MemeStickersApiPlugin(Star):
         finally:
             p.unlink(missing_ok=True)
 
-    async def _fetch_packs(self, force: bool = False) -> Dict[str, Any]:
+    async def _fetch_packs(self, force: bool = False, timeout: float | None = None) -> Dict[str, Any]:
         now = self._now()
         if not force and self._packs_cache and (now - self._packs_cache_time < self._cache_ttl):
             return self._packs_cache
 
         url = f"{self.server_url}/api/packs"
-        async with self._create_client() as client:
+        req_timeout = timeout if timeout is not None else self.timeout
+        async with httpx.AsyncClient(timeout=req_timeout, trust_env=not self._is_local) as client:
             resp = await client.get(url)
             resp.raise_for_status()
             data = resp.json()
@@ -810,8 +812,8 @@ class MemeStickersApiPlugin(Star):
             backend_err = ""
             t0 = time.time()
             try:
-                # 状态探测使用短超时（至多 5 秒），避免长时间挂起
-                async with httpx.AsyncClient(timeout=min(self.timeout, 5.0), trust_env=not self._is_local) as client:
+                # 状态探测使用短超时（至多 3.5 秒），避免长时间挂起
+                async with httpx.AsyncClient(timeout=min(self.timeout, 3.5), trust_env=not self._is_local) as client:
                     resp = await client.get(f"{self.server_url}/api/status")
                     if resp.status_code == 200:
                         backend_data = resp.json()
@@ -826,7 +828,7 @@ class MemeStickersApiPlugin(Star):
             packs = {}
             if backend_online:
                 try:
-                    packs = await self._fetch_packs()
+                    packs = await self._fetch_packs(force=False, timeout=min(self.timeout, 3.5))
                 except Exception as e:
                     backend_err = str(e)
                     logger.warning(f"web_get_status 获取贴纸列表异常: {e}")
@@ -880,11 +882,13 @@ class MemeStickersApiPlugin(Star):
 
     async def web_get_packs_detail(self, *args, **kwargs):
         try:
-            packs = await self._fetch_packs(force=True)
+            # 优先从缓存读取，若无缓存使用 4 秒超时探测，避免前端页面长时间挂起
+            packs = await self._fetch_packs(force=False, timeout=min(self.timeout, 4.0))
             return json_response({"status": "ok", "data": packs})
         except Exception as e:
             logger.warning(f"web_get_packs_detail 出错: {e}")
-            return json_response({"status": "ok", "data": {}})
+            fallback = self._packs_cache or {}
+            return json_response({"status": "ok", "data": fallback})
 
     async def web_generate(self, *args, **kwargs):
         try:
