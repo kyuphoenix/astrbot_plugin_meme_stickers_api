@@ -227,7 +227,9 @@ class MemeStickersApiPlugin(Star):
         params = {"pack": pack_slug, "format": "jpeg"}
         if category:
             params["category"] = category
-        async with self._create_client() as client:
+        # 网格渲染需加载多张贴纸，给予更充裕的超时时间（至少 45s）
+        timeout = max(45.0, self.timeout * 2)
+        async with httpx.AsyncClient(timeout=timeout, trust_env=not self._is_local) as client:
             resp = await client.get(url, params=params)
             if resp.status_code != 200:
                 try:
@@ -469,7 +471,11 @@ class MemeStickersApiPlugin(Star):
                 async for r in self._send_image(event, grid_bytes, f"pick_sticker_{default_slug}", ext="jpeg"):
                     yield r
             except Exception as e:
-                logger.warning(f"获取全量贴纸预览网格失败: {e}")
+                logger.error(f"获取全量贴纸预览网格失败: {e}", exc_info=True)
+                yield self._plain(
+                    event,
+                    f"⚠️ 贴纸预览图生成失败（{e}）。\n提示：你仍可直接发送贴纸名称或序号进行制作：",
+                )
             yield self._plain(
                 event,
                 f"已进入 {pack.get('name', default_slug)} 贴纸选择，请发送名称或序号（输入 0 退出）",
@@ -493,7 +499,11 @@ class MemeStickersApiPlugin(Star):
             async for r in self._send_image(event, grid_bytes, f"pick_category_{default_slug}", ext="jpeg"):
                 yield r
         except Exception as e:
-            logger.warning(f"获取分类预览网格失败: {e}")
+            logger.error(f"获取分类预览网格失败: {e}", exc_info=True)
+            yield self._plain(
+                event,
+                f"⚠️ 分类预览图生成失败（{e}）。\n提示：你仍可直接发送角色名称或序号进行选择：",
+            )
 
         yield self._plain(
             event,
@@ -590,7 +600,11 @@ class MemeStickersApiPlugin(Star):
                 async for r in self._send_image(event, grid_bytes, "pick_sticker", ext="jpeg"):
                     yield r
             except Exception as e:
-                logger.warning(f"获取贴纸预览网格失败: {e}")
+                logger.error(f"获取贴纸预览网格失败: {e}", exc_info=True)
+                yield self._plain(
+                    event,
+                    f"⚠️ 贴纸预览图生成失败（{e}）。\n提示：你仍可直接发送贴纸名称或序号：",
+                )
             yield self._plain(event, "请输入贴纸名称或序号（输入 r 返回分类，0 退出）")
             return
 
@@ -749,18 +763,30 @@ class MemeStickersApiPlugin(Star):
             backend_data = {}
             backend_online = False
             latency_ms = 0
+            backend_err = ""
             t0 = time.time()
             try:
-                async with self._create_client() as client:
+                # 状态探测使用短超时（至多 5 秒），避免长时间挂起
+                async with httpx.AsyncClient(timeout=min(self.timeout, 5.0), trust_env=not self._is_local) as client:
                     resp = await client.get(f"{self.server_url}/api/status")
                     if resp.status_code == 200:
                         backend_data = resp.json()
                         backend_online = True
                         latency_ms = int((time.time() - t0) * 1000)
+                    else:
+                        backend_err = f"HTTP {resp.status_code}"
             except Exception as e:
+                backend_err = str(e)
                 logger.warning(f"web_get_status 获取后端状态异常: {e}")
 
-            packs = await self._fetch_packs()
+            packs = {}
+            if backend_online:
+                try:
+                    packs = await self._fetch_packs()
+                except Exception as e:
+                    backend_err = str(e)
+                    logger.warning(f"web_get_status 获取贴纸列表异常: {e}")
+
             packs_data = []
             for slug, p in packs.items():
                 cat_keys = list(p.get("categories", {}).keys())
@@ -783,6 +809,7 @@ class MemeStickersApiPlugin(Star):
                     "available_packs_count": len(packs_data),
                     "server_url": self.server_url,
                     "backend_online": backend_online,
+                    "backend_error": backend_err,
                     "backend_latency_ms": latency_ms,
                     "backend": backend_data,
                     "emoji_font": {
@@ -812,8 +839,8 @@ class MemeStickersApiPlugin(Star):
             packs = await self._fetch_packs(force=True)
             return json_response({"status": "ok", "data": packs})
         except Exception as e:
-            logger.error(f"web_get_packs_detail 出错: {e}", exc_info=True)
-            return error_response(f"获取贴纸详情失败: {e}", status_code=500)
+            logger.warning(f"web_get_packs_detail 出错: {e}")
+            return json_response({"status": "ok", "data": {}})
 
     async def web_generate(self, *args, **kwargs):
         try:
