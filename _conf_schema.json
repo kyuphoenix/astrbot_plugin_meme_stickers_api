@@ -1,0 +1,35 @@
+{
+  "server_url": {
+    "description": "渲染后端服务地址",
+    "type": "string",
+    "default": "http://127.0.0.1:3000",
+    "hint": "部署好的 Node.js / Vercel Serverless 服务地址（如 http://127.0.0.1:3000 或 https://your-app.vercel.app）"
+  },
+  "quote_reply": {
+    "description": "是否引用触发消息",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，机器人发送表情包时会引用回复触发者的原消息。"
+  },
+  "timeout": {
+    "description": "请求超时时间 (秒)",
+    "type": "int",
+    "default": 15,
+    "slider": {
+      "min": 5,
+      "max": 60,
+      "step": 1
+    },
+    "hint": "向 Node.js 渲染后端发送请求的最大等待时间。"
+  },
+  "default_format": {
+    "description": "默认生成图片格式",
+    "type": "string",
+    "default": "png",
+    "options": [
+      "png",
+      "jpeg"
+    ],
+    "hint": "png 清晰度更高且支持透明通道；jpeg 体积更小传输更快。"
+  }
+}
