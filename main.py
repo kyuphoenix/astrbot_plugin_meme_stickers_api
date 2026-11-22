@@ -9,6 +9,24 @@ from typing import Optional, Dict, Any, List
 import httpx
 
 try:
+    from astrbot.api.web import request, json_response, error_response
+except ImportError:
+    request, json_response, error_response = None, None, None
+
+if json_response is None:
+    try:
+        from aiohttp import web
+        def json_response(data, status_code=200):
+            return web.json_response(data, status=status_code)
+        def error_response(msg, status_code=400):
+            return web.json_response({"status": "error", "message": str(msg)}, status=status_code)
+    except Exception:
+        def json_response(data, status_code=200):
+            return data
+        def error_response(msg, status_code=400):
+            return {"status": "error", "message": str(msg)}
+
+try:
     from astrbot.api.event import filter, AstrMessageEvent
     from astrbot.api.all import AstrBotConfig
     from astrbot.api.star import Context, Star, StarTools
@@ -98,8 +116,10 @@ class MemeStickersApiPlugin(Star):
         self._packs_cache: Optional[Dict[str, Any]] = None
         self._packs_cache_time: float = 0.0
         self._cache_ttl: float = 300.0  # 缓存 5 分钟
+        self.PLUGIN_NAME = "astrbot_plugin_meme_stickers_api"
         # 若是本地地址，禁用系统环境变量代理以避免 127.0.0.1 请求被本地梯子拦截
         self._is_local = "127.0.0.1" in self.server_url or "localhost" in self.server_url
+        self._register_web_apis()
 
     async def initialize(self) -> None:
         self._terminated = False
@@ -201,6 +221,22 @@ class MemeStickersApiPlugin(Star):
 
             _, b64_data = data_uri.split(",", 1)
             return base64.b64decode(b64_data)
+
+    async def _call_grid_api(self, pack_slug: str, category: Optional[str] = None) -> bytes:
+        url = f"{self.server_url}/api/grid"
+        params = {"pack": pack_slug, "format": "jpeg"}
+        if category:
+            params["category"] = category
+        async with self._create_client() as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code != 200:
+                try:
+                    err = resp.json()
+                    msg = err.get("message") or resp.text
+                except Exception:
+                    msg = resp.text
+                raise RuntimeError(f"预览网格生成失败 ({resp.status_code}): {msg}")
+            return resp.content
 
     @staticmethod
     def _parse_generate_args(tokens: List[str]) -> tuple[dict, List[str]]:
@@ -324,8 +360,18 @@ class MemeStickersApiPlugin(Star):
             return
 
         if sub == "generate":
+            if len(args) == 1:
+                # 交互式制作模式，默认针对 pjsk
+                async for r in self._handle_shortcut_cmd(event, "pjsk"):
+                    yield r
+                return
+            if len(args) == 2:
+                # /meme-stickers generate <pack_slug> 交互式制作
+                async for r in self._handle_shortcut_cmd(event, args[1]):
+                    yield r
+                return
             if len(args) < 4:
-                yield self._plain(event, "用法: /meme-stickers generate <pack_slug> <贴纸名> <文本> [参数]")
+                yield self._plain(event, "用法: /meme-stickers generate [pack_slug] 或 /meme-stickers generate <pack_slug> <贴纸名> <文本> [参数]")
                 return
 
             pack_slug = args[1]
@@ -412,20 +458,22 @@ class MemeStickersApiPlugin(Star):
 
         # 如果贴纸包禁用了分类选择（如 Arcaea），直接一步展示所有表情
         if pack.get("disable_category_select"):
-            all_stickers = []
-            for cat, s_list in pack.get("categories", {}).items():
-                all_stickers.extend(s_list)
             sid = self._sid(event)
             self._get_sessions()[sid] = self._new_session(
                 mode="shortcut",
                 step="pick_sticker",
                 pack_slug=default_slug,
             )
-            lines = [f"🎨 已进入 {pack.get('name', default_slug)} 贴纸制作，请选择表情:"]
-            for i, st_item in enumerate(all_stickers, 1):
-                lines.append(f"{i}. {st_item.get('name', '')}")
-            lines.append("\n请输入表情序号或名称（输入 0 或'退出'取消）:")
-            yield self._plain(event, "\n".join(lines))
+            try:
+                grid_bytes = await self._call_grid_api(default_slug)
+                async for r in self._send_image(event, grid_bytes, f"pick_sticker_{default_slug}", ext="jpeg"):
+                    yield r
+            except Exception as e:
+                logger.warning(f"获取全量贴纸预览网格失败: {e}")
+            yield self._plain(
+                event,
+                f"已进入 {pack.get('name', default_slug)} 贴纸选择，请发送名称或序号（输入 0 退出）",
+            )
             return
 
         categories = sorted(pack.get("categories", {}).keys())
@@ -440,12 +488,17 @@ class MemeStickersApiPlugin(Star):
             pack_slug=default_slug,
         )
 
-        lines = [f"🎨 已进入 {pack.get('name', default_slug)} 贴纸制作，请选择角色分类:"]
-        for i, cat in enumerate(categories, 1):
-            count = len(pack["categories"][cat])
-            lines.append(f"{i}. {cat} ({count} 个表情)")
-        lines.append("\n请输入分类序号或名称（输入 0 或'退出'取消）:")
-        yield self._plain(event, "\n".join(lines))
+        try:
+            grid_bytes = await self._call_grid_api(default_slug)
+            async for r in self._send_image(event, grid_bytes, f"pick_category_{default_slug}", ext="jpeg"):
+                yield r
+        except Exception as e:
+            logger.warning(f"获取分类预览网格失败: {e}")
+
+        yield self._plain(
+            event,
+            f"已进入 {pack.get('name', default_slug)} 角色选择，请发送名称或序号（输入 0 退出）",
+        )
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=50)
     async def on_message(self, event: AstrMessageEvent):
@@ -532,12 +585,13 @@ class MemeStickersApiPlugin(Star):
                 return
 
             st.step = "pick_sticker"
-            lines = [f"已选择【{chosen_cat}】，请选择具体表情:"]
-            for i, s in enumerate(stickers, 1):
-                sname = s.get("name", f"贴纸{i}")
-                lines.append(f"{i}. {sname}")
-            lines.append("\n请输入表情序号或名称（输入 r 返回分类，0 退出）:")
-            yield self._plain(event, "\n".join(lines))
+            try:
+                grid_bytes = await self._call_grid_api(st.pack_slug or "pjsk", category=chosen_cat)
+                async for r in self._send_image(event, grid_bytes, "pick_sticker", ext="jpeg"):
+                    yield r
+            except Exception as e:
+                logger.warning(f"获取贴纸预览网格失败: {e}")
+            yield self._plain(event, "请输入贴纸名称或序号（输入 r 返回分类，0 退出）")
             return
 
         # 步骤 2：选择表情
@@ -550,11 +604,13 @@ class MemeStickersApiPlugin(Star):
                 st.step = "pick_category"
                 st.invalid_count = 0
                 self._touch_session(st)
-                categories = sorted(pack.get("categories", {}).keys())
-                lines = ["已返回分类选择，请选择分类序号:"]
-                for i, cat in enumerate(categories, 1):
-                    lines.append(f"{i}. {cat}")
-                yield self._plain(event, "\n".join(lines))
+                try:
+                    grid_bytes = await self._call_grid_api(st.pack_slug or "pjsk")
+                    async for r in self._send_image(event, grid_bytes, "pick_category", ext="jpeg"):
+                        yield r
+                except Exception as e:
+                    logger.warning(f"获取分类预览网格失败: {e}")
+                yield self._plain(event, "已返回角色分类选择，请发送名称或序号（输入 0 退出）")
                 return
 
             if pack.get("disable_category_select"):
@@ -605,3 +661,248 @@ class MemeStickersApiPlugin(Star):
                 yield self._plain(event, f"生成表情包失败: {e}")
             finally:
                 sessions.pop(sid, None)
+
+    def _register_web_apis(self):
+        if not hasattr(self.context, "register_web_api"):
+            return
+        apis = [
+            (f"/{self.PLUGIN_NAME}/status", self.web_get_status, ["GET"], "获取API插件与后端状态"),
+            (f"/{self.PLUGIN_NAME}/packs", self.web_get_packs_detail, ["GET"], "获取贴纸包详情树"),
+            (f"/{self.PLUGIN_NAME}/generate", self.web_generate, ["POST"], "Playground生成贴纸图片"),
+            (f"/{self.PLUGIN_NAME}/sticker_image", self.web_get_sticker_image, ["GET"], "获取贴纸底图"),
+            (f"/{self.PLUGIN_NAME}/font/primary", self.web_get_primary_font, ["GET"], "获取主字体"),
+            (f"/{self.PLUGIN_NAME}/reload", self.web_reload_packs, ["POST"], "重载贴纸包"),
+            (f"/{self.PLUGIN_NAME}/switch_mirror", self.web_switch_mirror, ["POST"], "切换镜像源预设"),
+        ]
+        for route, handler, methods, desc in apis:
+            try:
+                self.context.register_web_api(route, handler, methods, desc)
+            except Exception as e:
+                logger.warning(f"注册 Web API {route} 失败: {e}")
+
+    @staticmethod
+    async def _parse_request_json(req):
+        if req is None:
+            return {}
+        if hasattr(req, "json"):
+            j = getattr(req, "json")
+            if callable(j):
+                try:
+                    res = j()
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                    if isinstance(res, dict):
+                        return res
+                except Exception:
+                    pass
+            elif isinstance(j, dict):
+                return j
+        if hasattr(req, "get_json"):
+            gj = getattr(req, "get_json")
+            if callable(gj):
+                try:
+                    res = gj()
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                    if isinstance(res, dict):
+                        return res
+                except Exception:
+                    pass
+        for attr in ("body", "data", "_body"):
+            if hasattr(req, attr):
+                val = getattr(req, attr)
+                if isinstance(val, (bytes, str)):
+                    import json
+                    try:
+                        res = json.loads(val)
+                        if isinstance(res, dict):
+                            return res
+                    except Exception:
+                        pass
+                elif isinstance(val, dict):
+                    return val
+        return {}
+
+    @staticmethod
+    def _parse_query_params(req, *args, **kwargs):
+        r = kwargs.get("request") or (args[0] if args else req)
+        if not r:
+            return {}
+        if hasattr(r, "query_params"):
+            return dict(r.query_params)
+        if hasattr(r, "args"):
+            return dict(r.args)
+        if hasattr(r, "query"):
+            return dict(r.query)
+        if hasattr(r, "url"):
+            try:
+                from urllib.parse import parse_qs, urlparse
+                u = urlparse(str(r.url))
+                q = parse_qs(u.query)
+                return {k: v[0] for k, v in q.items() if v}
+            except Exception:
+                pass
+        return {}
+
+    async def web_get_status(self, *args, **kwargs):
+        try:
+            backend_data = {}
+            backend_online = False
+            latency_ms = 0
+            t0 = time.time()
+            try:
+                async with self._create_client() as client:
+                    resp = await client.get(f"{self.server_url}/api/status")
+                    if resp.status_code == 200:
+                        backend_data = resp.json()
+                        backend_online = True
+                        latency_ms = int((time.time() - t0) * 1000)
+            except Exception as e:
+                logger.warning(f"web_get_status 获取后端状态异常: {e}")
+
+            packs = await self._fetch_packs()
+            packs_data = []
+            for slug, p in packs.items():
+                cat_keys = list(p.get("categories", {}).keys())
+                st_count = sum(len(l) for l in p.get("categories", {}).values())
+                packs_data.append({
+                    "slug": slug,
+                    "name": p.get("name", slug),
+                    "description": p.get("description", ""),
+                    "stickers_count": st_count,
+                    "categories": cat_keys,
+                    "disabled": False,
+                    "unavailable": False,
+                })
+
+            return json_response({
+                "status": "ok",
+                "data": {
+                    "installed_packs": packs_data,
+                    "total_packs": len(packs_data),
+                    "available_packs_count": len(packs_data),
+                    "server_url": self.server_url,
+                    "backend_online": backend_online,
+                    "backend_latency_ms": latency_ms,
+                    "backend": backend_data,
+                    "emoji_font": {
+                        "name": "NotoColorEmoji.ttf",
+                        "exists": True,
+                        "size_mb": 0,
+                    },
+                    "primary_font": {
+                        "name": "YurukaFangTang.ttf",
+                        "exists": True,
+                    },
+                    "config": {
+                        "server_url": self.server_url,
+                        "quote_reply": self.quote_reply,
+                        "timeout": self.timeout,
+                        "default_format": self.default_format,
+                    },
+                    "bundled_fonts": ["YurukaFangTang"],
+                }
+            })
+        except Exception as e:
+            logger.error(f"web_get_status 出错: {e}", exc_info=True)
+            return error_response(f"获取状态失败: {e}", status_code=500)
+
+    async def web_get_packs_detail(self, *args, **kwargs):
+        try:
+            packs = await self._fetch_packs(force=True)
+            return json_response({"status": "ok", "data": packs})
+        except Exception as e:
+            logger.error(f"web_get_packs_detail 出错: {e}", exc_info=True)
+            return error_response(f"获取贴纸详情失败: {e}", status_code=500)
+
+    async def web_generate(self, *args, **kwargs):
+        try:
+            req = kwargs.get("request") or (args[0] if args else request)
+            body = await self._parse_request_json(req)
+            url = f"{self.server_url}/api/generate"
+            async with self._create_client() as client:
+                resp = await client.post(url, json=body)
+                if resp.status_code != 200:
+                    try:
+                        err_j = resp.json()
+                        msg = err_j.get("message") or err_j.get("error") or resp.text
+                    except Exception:
+                        msg = resp.text
+                    return error_response(f"后端生成失败 ({resp.status_code}): {msg}", status_code=resp.status_code)
+                return json_response(resp.json())
+        except Exception as e:
+            logger.error(f"web_generate 出错: {e}", exc_info=True)
+            return error_response(f"生成表情包失败: {e}", status_code=500)
+
+    async def web_get_sticker_image(self, *args, **kwargs):
+        try:
+            req = kwargs.get("request") or (args[0] if args else request)
+            q = self._parse_query_params(req, *args, **kwargs)
+            pack_slug = q.get("pack")
+            file_name = q.get("file")
+            if not pack_slug or not file_name:
+                return error_response("缺少 pack 或 file 参数", status_code=400)
+            urls = [
+                f"{self.server_url}/packs/{pack_slug}/{file_name}",
+                f"https://cdn.jsdelivr.net/gh/lgc-NB2Dev/meme-stickers-hub@main/{pack_slug}/{file_name}",
+                f"https://ghfast.top/https://raw.githubusercontent.com/lgc-NB2Dev/meme-stickers-hub@main/{pack_slug}/{file_name}",
+            ]
+            async with self._create_client() as client:
+                for u in urls:
+                    try:
+                        resp = await client.get(u)
+                        if resp.status_code == 200 and len(resp.content) > 100:
+                            b64 = base64.b64encode(resp.content).decode("ascii")
+                            mime = resp.headers.get("content-type") or "image/png"
+                            return json_response({
+                                "status": "ok",
+                                "data": {
+                                    "data_uri": f"data:{mime};base64,{b64}"
+                                }
+                            })
+                    except Exception:
+                        pass
+            return error_response(f"未找到贴纸底图: {file_name}", status_code=404)
+        except Exception as e:
+            logger.error(f"web_get_sticker_image 出错: {e}", exc_info=True)
+            return error_response(f"获取底图失败: {e}", status_code=500)
+
+    async def web_get_primary_font(self, *args, **kwargs):
+        try:
+            urls = [
+                f"{self.server_url}/fonts/YurukaFangTang.ttf",
+                "https://cdn.jsdelivr.net/gh/kyuphoenix/astrbot_plugin_meme_stickers@main/astrbot_plugin_meme_stickers/meme_stickers_core/fonts/YurukaFangTang.ttf",
+            ]
+            async with self._create_client() as client:
+                for u in urls:
+                    try:
+                        resp = await client.get(u)
+                        if resp.status_code == 200 and len(resp.content) > 1000:
+                            b64 = base64.b64encode(resp.content).decode("ascii")
+                            return json_response({
+                                "status": "ok",
+                                "data": {
+                                    "data_uri": f"data:font/ttf;base64,{b64}"
+                                }
+                            })
+                    except Exception:
+                        pass
+            return error_response("未获取到主字体", status_code=404)
+        except Exception as e:
+            logger.error(f"web_get_primary_font 出错: {e}", exc_info=True)
+            return error_response(f"获取主字体失败: {e}", status_code=500)
+
+    async def web_reload_packs(self, *args, **kwargs):
+        self._packs_cache = None
+        self._packs_cache_time = 0.0
+        packs = await self._fetch_packs(force=True)
+        return json_response({
+            "status": "ok",
+            "data": { "total": len(packs) }
+        })
+
+    async def web_switch_mirror(self, *args, **kwargs):
+        return json_response({
+            "status": "ok",
+            "data": { "message": "API版使用后端集中式镜像调度，已同步刷新" }
+        })

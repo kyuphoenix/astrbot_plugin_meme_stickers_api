@@ -1,6 +1,10 @@
 name: astrbot_plugin_meme_stickers_api
 display_name: Arc/pjsk表情包制作(API版)
 desc: Meme Stickers AstrBot API轻量版。无需本地安装 skia-python 或 C++ 动态库，通过 Node.js / Serverless API 极速生成表情包！
-version: v1.0.2
+version: v1.1.0
 author: kyuphoenix
 repo: https://github.com/kyuphoenix/astrbot_plugin_meme_stickers_api
+views:
+  playground:
+    title: 表情包游乐场 (Playground)
+    icon: palette
