@@ -170,9 +170,23 @@ function calcRotatedAABB(box, origin, deg) {
 }
 
 // -------------------------------------------------------------
-// Font Loading: CacheStorage + Local Plugin File + CDN Fallback
+// Font Loading: CacheStorage (0ms) -> CDN (Prioritized) -> Server Fallback
 // -------------------------------------------------------------
 const FONT_NAME = "YurukaFangTang";
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function initWebFont() {
   if (document.fonts && document.fonts.check(`16px "${FONT_NAME}"`)) {
@@ -184,30 +198,59 @@ async function initWebFont() {
   const CACHE_KEY = "/fonts/YurukaFangTang.ttf";
   let fontBuffer = null;
 
-  // 1. Check browser CacheStorage (0ms instant across sessions)
+  // 1. Check browser CacheStorage (0ms instant across sessions, no network hit)
   try {
     if (typeof caches !== "undefined") {
       const cache = await caches.open(CACHE_NAME);
       const cachedResp = await cache.match(CACHE_KEY);
       if (cachedResp && cachedResp.ok) {
         fontBuffer = await cachedResp.arrayBuffer();
-        console.log(`[Font] Loaded ${FONT_NAME}.ttf from CacheStorage (0ms)`);
+        console.log(`[Font] Loaded ${FONT_NAME}.ttf from browser CacheStorage (0ms)`);
       }
     }
   } catch (err) {
     console.warn("[Font] CacheStorage check error:", err);
   }
 
-  // 2. Fetch directly from AstrBot plugin local font endpoint (bundled in plugin, 100% reliable)
+  // 2. Fetch from CDN prioritized (saves host/server bandwidth)
   if (!fontBuffer) {
-    const localUrls = [
+    const cdnUrls = [
+      "https://cdn.jsdelivr.net/gh/kyuphoenix/astrbot_plugin_meme_stickers_api@main/fonts/YurukaFangTang.ttf",
+      "https://cdn.jsdelivr.net/gh/kyuphoenix/pjsk-stickers-server@main/fonts/YurukaFangTang.ttf",
+      "https://raw.githubusercontent.com/kyuphoenix/astrbot_plugin_meme_stickers_api/main/fonts/YurukaFangTang.ttf",
+      "https://raw.githubusercontent.com/kyuphoenix/pjsk-stickers-server/main/fonts/YurukaFangTang.ttf",
+    ];
+    for (const url of cdnUrls) {
+      try {
+        console.log(`[Font] 优先尝试 CDN 加载字体: ${url}`);
+        const resp = await fetchWithTimeout(url, { mode: "cors" }, 4500);
+        if (resp && resp.ok) {
+          const buf = await resp.arrayBuffer();
+          if (buf && buf.byteLength > 100000) {
+            fontBuffer = buf;
+            console.log(`[Font] CDN 字体加载成功! 大小: ${(buf.byteLength / 1024 / 1024).toFixed(2)} MB`);
+            break;
+          }
+        }
+      } catch (e) {
+        console.warn(`[Font] CDN 拉取失败 (${e.message || e}), 尝试下一源...`);
+      }
+    }
+  }
+
+  // 3. Fallback: Fetch from server (AstrBot local plugin or backend server) if CDN fails
+  if (!fontBuffer) {
+    console.log("[Font] 所有 CDN 加载失败或超时，回退从服务器拉取字体...");
+    const serverUrls = [
       `/api/plug/${PLUGIN_NAME}/font/file`,
+      ...(serverUrl ? [`${serverUrl}/fonts/YurukaFangTang.ttf`] : []),
       `/api/plug/${PLUGIN_NAME}/font/primary`,
     ];
-    for (const url of localUrls) {
+    for (const url of serverUrls) {
       try {
-        const resp = await fetch(url);
-        if (resp.ok) {
+        console.log(`[Font] 尝试从服务器拉取: ${url}`);
+        const resp = await fetchWithTimeout(url, {}, 8000);
+        if (resp && resp.ok) {
           if (url.endsWith("/primary")) {
             const j = await resp.json();
             const b64 = (j.data?.data_uri || j.data_uri || "").split(",")[1];
@@ -216,51 +259,32 @@ async function initWebFont() {
               const bytes = new Uint8Array(bin.length);
               for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
               fontBuffer = bytes.buffer;
+              console.log("[Font] 服务器 Base64 字体加载成功!");
               break;
             }
           } else {
             const buf = await resp.arrayBuffer();
             if (buf && buf.byteLength > 100000) {
               fontBuffer = buf;
+              console.log(`[Font] 服务器二进制字体拉取成功! 大小: ${(buf.byteLength / 1024 / 1024).toFixed(2)} MB`);
               break;
             }
           }
         }
       } catch (e) {
-        console.warn(`[Font] Failed to fetch local font from ${url}:`, e);
+        console.warn(`[Font] 从服务器拉取失败 (${url}):`, e);
       }
     }
   }
 
-  // 3. Fallback: jsDelivr CDN and GitHub mirrors
-  if (!fontBuffer) {
-    const cdnUrls = [
-      "https://cdn.jsdelivr.net/gh/kyuphoenix/pjsk-stickers-server@main/fonts/YurukaFangTang.ttf",
-      "https://ghfast.top/https://raw.githubusercontent.com/kyuphoenix/pjsk-stickers-server/main/fonts/YurukaFangTang.ttf",
-      "https://raw.githubusercontent.com/kyuphoenix/pjsk-stickers-server/main/fonts/YurukaFangTang.ttf",
-    ];
-    for (const url of cdnUrls) {
-      try {
-        const resp = await fetch(url, { mode: "cors" });
-        if (resp.ok) {
-          const buf = await resp.arrayBuffer();
-          if (buf && buf.byteLength > 100000) {
-            fontBuffer = buf;
-            break;
-          }
-        }
-      } catch (e) {}
-    }
-  }
-
-  // 4. Register FontFace with browser
+  // 4. Register FontFace with browser & save to CacheStorage
   if (fontBuffer) {
     try {
       const fontFace = new FontFace(FONT_NAME, fontBuffer);
       await fontFace.load();
       document.fonts.add(fontFace);
       fontLoaded = true;
-      console.log(`[Font] "${FONT_NAME}" successfully registered!`);
+      console.log(`[Font] "${FONT_NAME}" 成功注册到浏览器字体库!`);
 
       // Save to CacheStorage for next visit
       if (typeof caches !== "undefined") {
